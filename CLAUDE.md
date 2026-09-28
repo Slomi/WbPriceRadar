@@ -15,4 +15,4 @@ Python 3.11, aiogram 3, SQLite.
 - [x] Код, сквозной прогон через настоящие обработчики (`video/gen_script.py`)
 - [x] Живой тест: @wbmonitor_tbot
 - [x] Демо-ролик: `media/wb_radar_demo.mp4`. Собран навыком `tg-bot-demo-video` (`~/.claude/skills`): `video/gen_script.py` → `cd video && npx remotion render BotDemo ../media/wb_radar_demo.mp4`
-- [ ] GitHub
+- [x] GitHub: github.com/Slomi/WbPriceRadar (публичный)
