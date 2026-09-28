@@ -16,11 +16,16 @@ CREATE TABLE IF NOT EXISTS products (
     nm          INTEGER NOT NULL,
     name        TEXT, brand TEXT, supplier TEXT,
     role        TEXT NOT NULL,                    -- mine / rival
-    parent_id   INTEGER,                          -- для конкурента: id «моего» товара
+    parent_id   INTEGER,                          -- устарело: связи теперь в таблице links
     price       REAL, basic REAL, qty INTEGER, rating REAL, feedbacks INTEGER,
     checked_at  TEXT,
     created_at  TEXT DEFAULT (datetime('now')),
     UNIQUE (user_id, nm)
+);
+CREATE TABLE IF NOT EXISTS links (               -- конкурент ↔ мой товар, многие-ко-многим
+    rival_id  INTEGER NOT NULL,
+    mine_id   INTEGER NOT NULL,
+    PRIMARY KEY (rival_id, mine_id)
 );
 CREATE TABLE IF NOT EXISTS history (             -- общая для всех пользователей: один артикул — одна история
     nm      INTEGER NOT NULL,
@@ -54,6 +59,10 @@ async def _exec(sql: str, params: tuple = ()) -> int:
 async def init() -> None:
     async with _connect() as conn:
         await conn.executescript(SCHEMA)
+        # миграция со старой схемы «один конкурент — один мой товар»
+        await conn.execute("INSERT OR IGNORE INTO links (rival_id, mine_id) "
+                           "SELECT id, parent_id FROM products WHERE parent_id IS NOT NULL")
+        await conn.execute("UPDATE products SET parent_id=NULL WHERE parent_id IS NOT NULL")
         await conn.commit()
 
 
@@ -76,16 +85,21 @@ async def users_with_products() -> list[aiosqlite.Row]:
 
 # --- товары ---
 
-async def add_product(user_id: int, card, role: str, parent_id: int | None) -> int | None:
+async def add_product(user_id: int, card, role: str) -> int | None:
     """None — такой артикул у пользователя уже есть."""
     try:
         return await _exec(
-            "INSERT INTO products (user_id, nm, name, brand, supplier, role, parent_id, price, basic, qty, rating, "
-            "feedbacks, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-            (user_id, card.nm, card.name, card.brand, card.supplier, role, parent_id, card.price, card.basic,
+            "INSERT INTO products (user_id, nm, name, brand, supplier, role, price, basic, qty, rating, "
+            "feedbacks, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+            (user_id, card.nm, card.name, card.brand, card.supplier, role, card.price, card.basic,
              card.qty, card.rating, card.feedbacks))
     except aiosqlite.IntegrityError:
         return None
+
+
+async def get_by_nm(user_id: int, nm: int) -> aiosqlite.Row | None:
+    rows = await _fetch("SELECT * FROM products WHERE user_id=? AND nm=?", (user_id, nm))
+    return rows[0] if rows else None
 
 
 async def get_product(product_id: int, user_id: int) -> aiosqlite.Row | None:
@@ -101,13 +115,41 @@ async def count_products(user_id: int) -> int:
     return (await _fetch("SELECT COUNT(*) AS n FROM products WHERE user_id=?", (user_id,)))[0]["n"]
 
 
-async def rivals_of(product_id: int) -> list[aiosqlite.Row]:
-    return await _fetch("SELECT * FROM products WHERE parent_id=? ORDER BY price IS NULL, price", (product_id,))
+async def rivals_of(mine_id: int) -> list[aiosqlite.Row]:
+    return await _fetch("SELECT p.* FROM products p JOIN links l ON l.rival_id=p.id WHERE l.mine_id=? "
+                        "ORDER BY p.price IS NULL, p.price", (mine_id,))
+
+
+async def mines_of(rival_id: int) -> list[aiosqlite.Row]:
+    return await _fetch("SELECT p.* FROM products p JOIN links l ON l.mine_id=p.id WHERE l.rival_id=? ORDER BY p.id",
+                        (rival_id,))
+
+
+async def all_links(user_id: int) -> list[tuple[int, int]]:
+    rows = await _fetch("SELECT l.rival_id, l.mine_id FROM links l JOIN products p ON p.id=l.rival_id "
+                        "WHERE p.user_id=?", (user_id,))
+    return [(r["rival_id"], r["mine_id"]) for r in rows]
+
+
+async def set_links(rival_id: int, mine_ids: list[int]) -> None:
+    async with _connect() as conn:
+        await conn.execute("DELETE FROM links WHERE rival_id=?", (rival_id,))
+        await conn.executemany("INSERT OR IGNORE INTO links (rival_id, mine_id) VALUES (?, ?)",
+                               [(rival_id, m) for m in mine_ids])
+        await conn.commit()
+
+
+async def add_links(rival_id: int, mine_ids: list[int]) -> None:
+    async with _connect() as conn:
+        await conn.executemany("INSERT OR IGNORE INTO links (rival_id, mine_id) VALUES (?, ?)",
+                               [(rival_id, m) for m in mine_ids])
+        await conn.commit()
 
 
 async def delete_product(product_id: int, user_id: int) -> None:
-    await _exec("UPDATE products SET parent_id=NULL WHERE parent_id=? AND user_id=?", (product_id, user_id))
-    await _exec("DELETE FROM products WHERE id=? AND user_id=?", (product_id, user_id))
+    if await get_product(product_id, user_id):
+        await _exec("DELETE FROM links WHERE rival_id=? OR mine_id=?", (product_id, product_id))
+        await _exec("DELETE FROM products WHERE id=? AND user_id=?", (product_id, user_id))
 
 
 async def all_nms() -> list[int]:

@@ -66,11 +66,13 @@ async def card_text(p) -> str:
             cheaper = [r for r in rivals if r["price"] and p["price"] and r["price"] < p["price"]]
             lines += ["", f"<b>Конкуренты ({len(rivals)})</b>" + (f", дешевле вас: {len(cheaper)}" if cheaper else "")]
             lines += [f"• {escape(short(r['name'], 32))} — {rub(r['price'])}{_diff(r['price'], p['price'])}" for r in rivals]
-    elif p["parent_id"]:
-        mine = await db.get_product(p["parent_id"], p["user_id"])
-        if mine:
-            lines += ["", f"Ваш товар «{escape(short(mine['name'], 30))}»: {rub(mine['price'])}"
-                      + _diff(p["price"], mine["price"])]
+    else:
+        mines = await db.mines_of(p["id"])
+        if mines:
+            lines += ["", "<b>Конкурирует с вашими:</b>"]
+            lines += [f"• {escape(short(m['name'], 32))} — {rub(m['price'])}" + _diff(p["price"], m["price"]) for m in mines]
+        else:
+            lines += ["", "<i>Не привязан к вашим товарам — «🔗 Привязка», чтобы сравнивать цены</i>"]
     if p["checked_at"]:
         lines += ["", f"<i>Проверено {local(p['checked_at']):%d.%m %H:%M}</i>"]
     return "\n".join(lines)
@@ -81,7 +83,8 @@ async def daily_report(user_id: int) -> str:
     if not products:
         return "Пока нечего отслеживать — добавьте товары кнопкой «➕ Добавить товар»."
     mine = [p for p in products if p["role"] == "mine"]
-    loose = [p for p in products if p["role"] == "rival" and not p["parent_id"]]
+    linked = {r for r, _ in await db.all_links(user_id)}
+    loose = [p for p in products if p["role"] == "rival" and p["id"] not in linked]
     out = [f"📊 <b>Сводка на {now():%d.%m %H:%M}</b>"]
     alerts = 0
     for m in mine:
@@ -123,8 +126,8 @@ async def chart_png(p, days: int = 90) -> bytes:
     if p["role"] == "mine":
         main, others = p, await db.rivals_of(p["id"])
     else:
-        mine = await db.get_product(p["parent_id"], p["user_id"]) if p["parent_id"] else None
-        main, others = (mine, [p]) if mine else (p, [])
+        mines = await db.mines_of(p["id"])
+        main, others = (mines[0], [p] + list(mines[1:])) if mines else (p, [])
 
     fig, ax = plt.subplots(figsize=(10, 5.4), dpi=130)
     fig.patch.set_facecolor("#ffffff")
@@ -168,8 +171,15 @@ async def excel(user_id: int) -> bytes:
     head = ["Роль", "Мой товар", "Артикул", "Название", "Бренд", "Продавец", "Цена, ₽", "До скидки, ₽", "Скидка, %",
             "Разница с моим, ₽", "Остаток, шт", "Рейтинг", "Отзывы", "За 24 ч", "За 7 дней", "Проверено", "Ссылка"]
     ws.append(head)
+    links: dict[int, list[int]] = {}
+    for rival_id, mine_id in await db.all_links(user_id):
+        links.setdefault(rival_id, []).append(mine_id)
+    # конкурент, привязанный к нескольким вашим товарам, — отдельная строка на каждую пару
+    rows = [(p, None) for p in products if p["role"] == "mine"]
     for p in products:
-        parent = by_id.get(p["parent_id"]) if p["parent_id"] else None
+        if p["role"] == "rival":
+            rows += [(p, by_id[m]) for m in links.get(p["id"], []) if m in by_id] or [(p, None)]
+    for p, parent in rows:
         disc = round((1 - p["price"] / p["basic"]) * 100) if p["price"] and p["basic"] else None
         diff = round(p["price"] - parent["price"]) if parent and p["price"] and parent["price"] else None
         ws.append([

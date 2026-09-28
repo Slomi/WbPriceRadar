@@ -26,6 +26,11 @@ if config.ALLOWED_IDS:
 class Add(StatesGroup):
     links = State()   # ждём ссылки/артикулы
     role = State()    # ждём выбор «мои / конкуренты»
+    pick = State()    # отмечаем, к каким моим товарам привязать конкурентов
+
+
+class LinkEdit(StatesGroup):
+    pick = State()    # правка привязок одного конкурента из его карточки
 
 
 def _cycle(values: list, current):
@@ -62,7 +67,7 @@ async def add_start(message: Message, state: FSMContext):
     await message.answer("Пришлите ссылки на товары WB или артикулы — можно сразу несколько, через пробел или с новой строки.")
 
 
-async def _ask_role(message: Message, state: FSMContext, text: str, parent: int | None):
+async def _ask_role(message: Message, state: FSMContext, text: str, preset_mine: int | None):
     nms = wb.parse_nms(text)
     if not nms:
         return await message.answer("Не нашёл артикулов. Пример: https://www.wildberries.ru/catalog/839226871/detail.aspx")
@@ -78,18 +83,17 @@ async def _ask_role(message: Message, state: FSMContext, text: str, parent: int 
     lines = [f"• {escape(short(c.name, 45))} — <b>{rub(c.price)}</b>" for c in cards.values()]
     text = "Нашёл:\n" + "\n".join(lines) + (f"\n\nНе найдены: {', '.join(missing)}" if missing else "")
     await state.update_data(cards=[asdict(c) for c in cards.values()])
-    if parent is not None:  # добавляем конкурентов к выбранному товару без лишних вопросов
+    if preset_mine is not None:  # «➕ Конкурент» из карточки моего товара — привязываем сразу
         await message.answer(text)
-        return await _save(message, state, message.from_user.id, "rival", parent)
+        return await _save(message, state, message.from_user.id, "rival", {nm: [preset_mine] for nm in cards})
     await state.set_state(Add.role)
-    mine = [p for p in await db.user_products(message.from_user.id) if p["role"] == "mine"]
-    await message.answer(text + "\n\nЧьи это товары?", reply_markup=kb.role_kb(mine))
+    await message.answer(text + "\n\nЧьи это товары?", reply_markup=kb.role_kb())
 
 
 MENU_ACTIONS = {}  # кнопка меню посреди добавления — отменяем добавление и выполняем её
 
 
-@router.message(StateFilter(Add), F.text.func(lambda t: t in MENU_ACTIONS))
+@router.message(StateFilter(Add, LinkEdit), F.text.func(lambda t: t in MENU_ACTIONS))
 async def menu_during_add(message: Message, state: FSMContext):
     await state.clear()
     if message.text == kb.MENU_ADD:
@@ -99,8 +103,7 @@ async def menu_during_add(message: Message, state: FSMContext):
 
 @router.message(Add.links, F.text)
 async def add_links(message: Message, state: FSMContext):
-    parent = (await state.get_data()).get("parent")
-    await _ask_role(message, state, message.text, parent)
+    await _ask_role(message, state, message.text, (await state.get_data()).get("preset_mine"))
 
 
 @router.message(StateFilter(None), F.text.regexp(r"\d{5,12}"))
@@ -109,32 +112,143 @@ async def add_quick(message: Message, state: FSMContext):
     await _ask_role(message, state, message.text, None)
 
 
-async def _save(message: Message, state: FSMContext, user_id: int, role: str, parent: int | None):
+async def _save(message: Message, state: FSMContext, user_id: int, role: str,
+                plan: dict[int, list[int]] | None = None):
+    """plan: артикул конкурента → id моих товаров, к которым его привязать."""
     cards = [wb.Card(**c) for c in (await state.get_data()).get("cards", [])]
     await state.clear()
     if not cards:
         return await message.answer("Список устарел — пришлите ссылки ещё раз.", reply_markup=kb.main_menu())
-    added, dupes = [], []
+    added, dupes, linked = [], [], 0
     for c in cards:
-        pid = await db.add_product(user_id, c, role, parent or None)
+        pid = await db.add_product(user_id, c, role)
         (added if pid else dupes).append(c)
+        if role == "rival" and plan and plan.get(c.nm):
+            existing = await db.get_by_nm(user_id, c.nm)
+            if existing and existing["role"] == "rival":  # и для новых, и для уже отслеживаемых конкурентов
+                await db.add_links(existing["id"], plan[c.nm])
+                linked += 1
     status = await message.answer("⏳ Загружаю историю цен…")
     await asyncio.gather(*(monitor.seed_history(c) for c in added))
     who = "ваши товары" if role == "mine" else "конкуренты"
     text = f"✅ Добавлено: {len(added)} ({who})."
     if dupes:
         text += f"\nУже были в списке: {len(dupes)}."
+    if role == "rival":
+        text += (f"\nПривязано к вашим товарам: {linked}." if linked
+                 else "\nБез привязки — её можно задать в карточке конкурента («🔗 Привязка»).")
     if role == "mine" and added:
-        text += "\n\nТеперь добавьте конкурентов: «📋 Мои товары» → ваш товар → «➕ Конкурент»."
+        text += "\n\nТеперь добавьте конкурентов: пришлите их ссылки и выберите «🎯 Это конкуренты»."
     await status.edit_text(text)
     await message.answer("Проверяю цены автоматически — напишу, когда что-то изменится.", reply_markup=kb.main_menu())
+
+
+async def _mines(user_id: int):
+    return [p for p in await db.user_products(user_id) if p["role"] == "mine"]
+
+
+async def _render_pick(message: Message, state: FSMContext, user_id: int):
+    data = await state.get_data()
+    mines, selected = await _mines(user_id), set(data.get("selected", []))
+    cards = data.get("cards", [])
+    if data.get("mode") == "each":
+        i = data["idx"]
+        c = cards[i]
+        text = (f"🧩 <b>{i + 1} из {len(cards)}</b>: {escape(short(c['name'], 50))} — {rub(c['price'])}\n\n"
+                "С какими вашими товарами он конкурирует? Можно отметить несколько.")
+        markup = kb.pick_kb(mines, selected, "each", last=i == len(cards) - 1)
+    else:
+        text = ("🎯 К каким вашим товарам привязать конкурентов? Отметьте один или несколько — "
+                "буду сравнивать цены и предупреждать, если конкурент дешевле.")
+        markup = kb.pick_kb(mines, selected, "batch", can_each=len(cards) > 1)
+    await message.edit_text(text, reply_markup=markup)
 
 
 @router.callback_query(Add.role, kb.RoleCB.filter())
 async def add_role(cb: CallbackQuery, callback_data: kb.RoleCB, state: FSMContext):
     await cb.answer()
+    if callback_data.role == "rival" and await _mines(cb.from_user.id):
+        await state.set_state(Add.pick)
+        await state.update_data(mode="batch", selected=[])
+        return await _render_pick(cb.message, state, cb.from_user.id)
     await cb.message.edit_reply_markup(reply_markup=None)
-    await _save(cb.message, state, cb.from_user.id, callback_data.role, callback_data.parent or None)
+    await _save(cb.message, state, cb.from_user.id, callback_data.role)
+
+
+@router.callback_query(StateFilter(Add.pick, LinkEdit.pick), kb.PickCB.filter(F.action == "toggle"))
+async def pick_toggle(cb: CallbackQuery, callback_data: kb.PickCB, state: FSMContext):
+    selected = set((await state.get_data()).get("selected", []))
+    selected ^= {callback_data.id}
+    await state.update_data(selected=sorted(selected))
+    await cb.answer()
+    if await state.get_state() == LinkEdit.pick.state:
+        return await _render_link_edit(cb.message, state, cb.from_user.id)
+    await _render_pick(cb.message, state, cb.from_user.id)
+
+
+@router.callback_query(Add.pick, kb.PickCB.filter(F.action.in_({"done", "none"})))
+async def pick_batch(cb: CallbackQuery, callback_data: kb.PickCB, state: FSMContext):
+    data = await state.get_data()
+    selected = data.get("selected", []) if callback_data.action == "done" else []
+    await cb.answer()
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await _save(cb.message, state, cb.from_user.id, "rival", {c["nm"]: selected for c in data.get("cards", [])})
+
+
+@router.callback_query(Add.pick, kb.PickCB.filter(F.action == "each"))
+async def pick_each(cb: CallbackQuery, state: FSMContext):
+    await state.update_data(mode="each", idx=0, selected=[], plan={})
+    await cb.answer()
+    await _render_pick(cb.message, state, cb.from_user.id)
+
+
+@router.callback_query(Add.pick, kb.PickCB.filter(F.action == "next"))
+async def pick_next(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    cards, idx = data["cards"], data["idx"]
+    plan = {**data.get("plan", {}), str(cards[idx]["nm"]): data.get("selected", [])}
+    await cb.answer()
+    if idx + 1 < len(cards):
+        await state.update_data(idx=idx + 1, selected=[], plan=plan)
+        return await _render_pick(cb.message, state, cb.from_user.id)
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await _save(cb.message, state, cb.from_user.id, "rival", {int(k): v for k, v in plan.items()})
+
+
+# ---------- Привязка конкурента из его карточки ----------
+
+async def _render_link_edit(message: Message, state: FSMContext, user_id: int):
+    data = await state.get_data()
+    r = await db.get_product(data["rival_id"], user_id)
+    mines = await _mines(user_id)
+    if not mines:
+        await state.clear()
+        return await message.edit_text("Сначала добавьте свой товар — «⭐ Это мои товары».",
+                                       reply_markup=kb.product_kb(r))
+    await message.edit_text(f"🔗 С какими вашими товарами конкурирует «{escape(short(r['name'], 40))}»?",
+                            reply_markup=kb.pick_kb(mines, set(data.get("selected", [])), "edit"))
+
+
+@router.callback_query(kb.ProdCB.filter(F.action == "links"))
+async def links_edit(cb: CallbackQuery, callback_data: kb.ProdCB, state: FSMContext):
+    r = await db.get_product(callback_data.id, cb.from_user.id)
+    if not r:
+        return await cb.answer("Товар уже удалён", show_alert=True)
+    await state.set_state(LinkEdit.pick)
+    await state.update_data(rival_id=r["id"], selected=[m["id"] for m in await db.mines_of(r["id"])])
+    await cb.answer()
+    await _render_link_edit(cb.message, state, cb.from_user.id)
+
+
+@router.callback_query(LinkEdit.pick, kb.PickCB.filter(F.action.in_({"done", "cancel"})))
+async def links_save(cb: CallbackQuery, callback_data: kb.PickCB, state: FSMContext):
+    data = await state.get_data()
+    await state.clear()
+    if callback_data.action == "done":
+        await db.set_links(data["rival_id"], data.get("selected", []))
+    await cb.answer("Сохранено" if callback_data.action == "done" else None)
+    r = await db.get_product(data["rival_id"], cb.from_user.id)
+    await cb.message.edit_text(await reports.card_text(r), reply_markup=kb.product_kb(r), disable_web_page_preview=True)
 
 
 # ---------- Список и карточка ----------
@@ -146,7 +260,7 @@ async def _show_list(message: Message, user_id: int, edit: bool = False):
     else:
         mine = sum(p["role"] == "mine" for p in products)
         text = f"📋 <b>Отслеживаю {len(products)}</b>: ваших {mine}, конкурентов {len(products) - mine}.\n❗ — конкурент дешевле вас"
-        markup = kb.list_kb(products)
+        markup = kb.list_kb(products, await db.all_links(user_id))
     if edit:
         await message.edit_text(text, reply_markup=markup)
     else:
@@ -216,7 +330,7 @@ async def add_rival(cb: CallbackQuery, callback_data: kb.ProdCB, state: FSMConte
         return await cb.answer("Товар уже удалён", show_alert=True)
     await cb.answer()
     await state.set_state(Add.links)
-    await state.update_data(parent=p["id"])
+    await state.update_data(preset_mine=p["id"])
     await cb.message.answer(f"Пришлите ссылки или артикулы конкурентов для «{escape(short(p['name'], 40))}».")
 
 

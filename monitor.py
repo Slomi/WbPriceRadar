@@ -10,7 +10,7 @@ import config
 import db
 import reports
 import wb
-from utils import now, rub
+from utils import now, rub, short
 
 _check_lock = asyncio.Lock()
 
@@ -41,14 +41,15 @@ async def _alerts_for(p, card: wb.Card, user) -> list[str]:
     if old and new and old != new and abs(_pct(old, new)) >= user["price_pct"]:
         arrow = "📉 подешевел" if new < old else "📈 подорожал"
         line = f"{who} {arrow}: {rub(old)} → <b>{rub(new)}</b> ({_pct(old, new):+.0f}%)\n{title}"
-        if p["role"] == "rival" and p["parent_id"]:
-            mine = await db.get_product(p["parent_id"], p["user_id"])
-            if mine and mine["price"]:
+        if p["role"] == "rival":
+            mines = [m for m in await db.mines_of(p["id"]) if m["price"]]
+            for mine in mines:
                 diff = new - mine["price"]
+                name = f" «{escape(short(mine['name'], 30))}»" if len(mines) > 1 else ""
                 if diff < 0:
-                    line += f"\n⚠️ Теперь дешевле вашего товара на <b>{rub(-diff)}</b>"
+                    line += f"\n⚠️ Теперь дешевле вашего товара{name} на <b>{rub(-diff)}</b>"
                 elif diff > 0:
-                    line += f"\nВаш товар дешевле на {rub(diff)}"
+                    line += f"\nВаш товар{name} дешевле на {rub(diff)}"
         out.append(line)
 
     if p["qty"] is not None:

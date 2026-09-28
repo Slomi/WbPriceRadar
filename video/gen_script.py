@@ -169,7 +169,10 @@ class Demo:
                     if e.get("chat") == ADMIN_ID and e["op"] == "bot" and e["text"].startswith(starts))
 
 
-MY, RIVALS, STAGED = 608351566, [604961294, 1470151551, 839226871], 1470151551
+MINE_A, MINE_B = 608351566, 839226871
+RIVALS = [604961294, 1470151551, 1453309500]
+STAGED = 1470151551  # у этого конкурента для демо уведомления завышаем прошлую цену
+A, B = "⬜ Наушники беспроводные для", "⬜ Наушники беспроводные TWS"
 
 
 async def main():
@@ -181,16 +184,21 @@ async def main():
     try:
         await d.say(u, "/start")
         await d.say(u, "➕ Добавить товар")
-        await d.say(u, f"https://www.wildberries.ru/catalog/{MY}/detail.aspx")
+        await d.say(u, f"https://www.wildberries.ru/catalog/{MINE_A}/detail.aspx {MINE_B}")
         await d.click(u, "⭐ Это мои")
-        await d.say(u, "📋 Мои товары")
-        await d.click(u, "⭐ ")
-        await d.click(u, "➕ Конкурент")
         await d.say(u, " ".join(map(str, RIVALS)))
+        await d.click(u, "🎯 Это конкуренты")
+        await d.click(u, "🧩")
+        await d.click(u, A)                    # 1-й конкурент → товар A
+        await d.click(u, "Далее")
+        await d.click(u, A)                    # 2-й → A и B
+        await d.click(u, B)
+        await d.click(u, "Далее")
+        await d.click(u, B)                    # 3-й → B
+        await d.click(u, "✅ Готово")
         await d.say(u, "📋 Мои товары")
         await d.click(u, "⭐ ")
         await d.click(u, "📈")
-        # Демо уведомления: прошлая цена конкурента в базе завышена, дальше — настоящая проверка
         async with aiosqlite.connect(config.DB_PATH) as conn:
             await conn.execute("UPDATE products SET price = round(price * 1.25) WHERE nm=?", (STAGED,))
             await conn.commit()
@@ -198,8 +206,6 @@ async def main():
         await monitor.check_all(d.bot)
         await d.say(u, "📊 Сводка")
         await d.say(u, "📥 Excel")
-        await d.say(u, "⚙️ Настройки")
-        await d.click(u, "Уведомлять о цене")
     finally:
         if os.path.exists(config.DB_PATH):
             os.remove(config.DB_PATH)
