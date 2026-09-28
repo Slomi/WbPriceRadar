@@ -13,6 +13,6 @@ Python 3.11, aiogram 3, SQLite.
 
 ## Статус
 - [x] Код, сквозной прогон через настоящие обработчики (`video/gen_script.py`)
-- [ ] Бот в @BotFather, живой тест
-- [ ] Демо-ролик (Remotion, как в `../1/video`)
+- [x] Живой тест: @wbmonitor_tbot
+- [x] Демо-ролик: `media/wb_radar_demo.mp4`. Собран навыком `tg-bot-demo-video` (`~/.claude/skills`): `video/gen_script.py` → `cd video && npx remotion render BotDemo ../media/wb_radar_demo.mp4`
 - [ ] GitHub

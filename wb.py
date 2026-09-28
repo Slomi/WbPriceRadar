@@ -96,7 +96,7 @@ async def _history_json(s: AsyncSession, basket: int, nm: int):
     vol, part = nm // 100000, nm // 1000
     url = f"https://basket-{basket:02d}.wbbasket.ru/vol{vol}/part{part}/{nm}/info/price-history.json"
     try:
-        r = await s.get(url, timeout=8)
+        r = await s.get(url, timeout=12)
         if r.status_code == 200:
             return r.json()
     except Exception:
@@ -109,12 +109,16 @@ async def fetch_price_history(nm: int) -> list[tuple[datetime, float]]:
     vol = nm // 100000
     async with _session() as s:
         data = await _history_json(s, _basket_by_vol[vol], nm) if vol in _basket_by_vol else None
-        if data is None:
+        for attempt in range(2):  # WB иногда обрывает часть параллельных запросов — пробуем ещё раз
+            if data is not None:
+                break
             results = await asyncio.gather(*(_history_json(s, b, nm) for b in BASKETS))
             for b, res in zip(BASKETS, results):
                 if res is not None:
                     _basket_by_vol[vol], data = b, res
                     break
+    if data is None:
+        logging.warning("WB: не нашёл историю цен для %s", nm)
     if not isinstance(data, list):
         return []
     return [(datetime.fromtimestamp(x["dt"], timezone.utc), x["price"]["RUB"] / 100)
